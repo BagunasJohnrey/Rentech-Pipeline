@@ -6,6 +6,8 @@ RenTech: Rental Management System with Demand Forecasting for Mylene's Boutique 
 
 The goal of this stage is to extract data from an identified source system and prepare a documented, traceable, and validated dataset for the next stage of the data pipeline.
 
+This document covers Extraction and extraction-level validation only. Transformation and Load are documented separately and are not part of this stage.
+
 Planned pipeline name: rentech-nightly-rental-mart. Planned run: nightly batch, once per day, not live.
 
 ---
@@ -14,37 +16,73 @@ Planned pipeline name: rentech-nightly-rental-mart. Planned run: nightly batch, 
 
 ### 1.1 Source System
 
-- Name and purpose of the source system.
-- Source: RenTech shop system for Mylene's Boutique, a single store in Balayan, Batangas. Records clothes for rent (gowns, barongs, suits, costumes, Filipiniana), customer bookings, and payments. Purpose is daily and monthly rental reporting and demand forecasting.
+The source system is the RenTech shop system for Mylene's Boutique, a single store in Balayan, Batangas. It records clothes for rent (gowns, barongs, suits, costumes, Filipiniana), customer bookings, and payments. The system supports daily and monthly rental reporting and demand forecasting.
 
 ### 1.2 Source Database or File
 
-- Database management system: PostgreSQL.
-- Platform: Supabase, schema public.
-- File format, if applicable: planned output will be Parquet files in data/raw/dt=YYYY-MM-DD/, one dated folder per run with 4 files. No CSV, JSON, or Excel in the live process.
+The source runs on PostgreSQL, hosted on Supabase under the public schema. The planned output is Parquet files in data/raw/dt=YYYY-MM-DD/, one dated folder per run holding 4 files. No CSV, JSON, or Excel is used in the live process.
 
 ### 1.3 Extraction Method
 
-- Full or incremental: planned as incremental extraction.
-- Field and logic for extraction window: each table has created_at and updated_at. Last copy time will be saved in data/state/last_run.json. Tables with updated_at will use WHERE GREATEST(created_at, updated_at) > :last_run (transactions, inventory_items, profiles). payments has no updated_at, so will use WHERE created_at > :last_run.
-- How data will be extracted: read-only queries for new or changed rows only. First run with no saved time will copy everything. After that, only newer rows.
-- Extraction tool, script, or technology: planned Python scripts with psycopg3 + SQLAlchemy, pooled, SSL required, DATABASE_URL preferred with DIRECT_URL fallback, plus file-only demo mode that never touches the live database.
-- Extraction schedule: planned daily at 00:00 Asia/Manila, plus manual run by date for demos and missed days.
+The method is planned as incremental extraction. It copies only new or changed rows instead of reloading the whole database each time.
+
+The extraction window relies on each table's created_at and updated_at columns. The last copy time is saved in data/state/last_run.json. Tables that have updated_at (transactions, inventory_items, profiles) use WHERE GREATEST(created_at, updated_at) > :last_run. The payments table has no updated_at, so it uses WHERE created_at > :last_run.
+
+Extraction reads data with read-only queries for new or changed rows only. The first run has no saved time and copies everything; later runs copy only newer rows.
+
+The extraction tool is a planned set of Python scripts using psycopg3 and SQLAlchemy. The connection is pooled and requires SSL, preferring DATABASE_URL with DIRECT_URL as fallback.
+
+The extraction schedule is planned for daily at 00:00 Asia/Manila, plus manual runs by date for demos and missed days.
 
 ### 1.4 Extraction Scope
 
 - Data that will be extracted: only columns needed for sales and forecast.
 - Relevant tables, files, or date ranges: public.profiles, public.inventory_items, public.transactions, public.payments. Date range is everything newer than the saved watermark. Cancelled bookings and NULLs will be retained in raw for audit.
+- Filter rule: copy only rows where GREATEST(created_at, updated_at) > :last_run. payments has no updated_at, so use created_at > :last_run.
+- Rule: keep cancelled bookings and NULL values in the raw copy for audit; do not delete or clean here. Cleaning is covered in the separate Transformation document.
+
+#### 1.4.1 Needed Source Files (Tables) and Columns
+
+| # | Source File (Table) | Purpose for Sales and Forecast | Columns Needed |
+| - | ------------------- | ------------------------------ | -------------- |
+| 1 | public.profiles | Know who rented; link bookings to a customer. | id, name, phone, address, preferences, created_at, updated_at |
+| 2 | public.inventory_items | Know what was rented; category and sale info for correct revenue. | id, name, category, price, status, on_sale, discount_pct, sale_price, sale_ends_at, created_at, updated_at |
+| 3 | public.transactions | Main fact source; all revenue counts and demand reports. | id, customer_id, item_id, rental_date, due_date, return_date, status, rental_fee, downpayment, total_paid, balance, created_at, updated_at |
+| 4 | public.payments | Money log to double-check bookings. | id, transaction_id, amount, method, status, created_at |
+
+#### 1.4.2 Needed Output Files (Per Run)
+
+Saved in data/raw/dt=YYYY-MM-DD/, one file per source table. Four files per run.
+
+| # | Output File | Source Table | Format | Purpose |
+| - | ----------- | ------------ | ------ | ------- |
+| 1 | profiles.parquet | public.profiles | Parquet | Customer reference copy for the run. |
+| 2 | inventory_items.parquet | public.inventory_items | Parquet | Item and sale reference copy for the run. |
+| 3 | transactions.parquet | public.transactions | Parquet | Booking facts copy for the run. |
+| 4 | payments.parquet | public.payments | Parquet | Payment facts copy for the run. |
+
+#### 1.4.3 Scope Summary
+
+| Scope Item | Value |
+| ---------- | ----- |
+| Number of source tables | 4 |
+| Number of output files per run | 4 (one Parquet file per table) |
+| Data extracted | Only columns needed for sales and forecast |
+| Date range | Everything newer than the saved watermark, using the filter rule above |
+| Rows kept in raw | Cancelled bookings and NULLs retained for audit |
+| Cleaning | Out of scope; covered in the separate Transformation document |
 
 ### 1.5 Source Limitations and Assumptions
 
-- Read-only on shop tables; write-only on final mart_ tables.
-- payments has no updated_at, so late fixes to old payments can be missed. Planned weekly full re-check of payments.
-- Dates are timezone-naive. One date style must be used to avoid skipped rows.
-- No internet, wrong password, or asleep database will block the run. Plan is to stop safely, keep old checkpoint, and retry.
-- Schema changes (renamed or added columns) will stop the run with an error. Column list and this doc must be updated together.
-- Restricted access can block reads. Read access on the 4 tables will be required.
-- Small volume (hundreds of rows). One computer, nightly batch is enough.
+| # | Limitation or Assumption | How It Is Handled |
+| - | ------------------------ | ----------------- |
+| 1 | Read-only on the shop tables. | The pipeline never writes back to source tables. |
+| 2 | payments has no updated_at, so late fixes to old payments can be missed. | Planned weekly full re-check of payments. |
+| 3 | Dates are timezone-naive. | One date style is used to avoid skipped rows. |
+| 4 | No internet, wrong password, or asleep database blocks the run. | Stop safely, keep the old checkpoint, and retry. |
+| 5 | Schema changes (renamed or added columns) stop the run with an error. | Update the column list and this doc together before re-running. |
+| 6 | Restricted access can block reads. | Read access on the 4 tables is required. |
+| 7 | Small volume (hundreds of rows). | One computer and a nightly batch are enough. |
 
 ---
 
@@ -52,47 +90,62 @@ Planned pipeline name: rentech-nightly-rental-mart. Planned run: nightly batch, 
 
 Only columns relevant to the pipeline are listed. Every row of the source table is not copied here.
 
-### profiles
+### 2.1 Table Overview
 
-- Name: public.profiles
-- Purpose: customer and staff reference, to know who rented.
-- Important columns and types: id TEXT, name TEXT, phone TEXT NULL, address TEXT NULL, preferences TEXT NULL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ.
-- Primary key: id.
-- Relationships: referenced by transactions.customer_id.
-- Reason for inclusion: without it, bookings cannot be linked to customers.
+| Table | Purpose | Primary Key | Relationships | Reason for Inclusion |
+| ----- | ------- | ----------- | ------------- | -------------------- |
+| public.profiles | Customer and staff reference, to know who rented. | id | Referenced by transactions.customer_id | Without it, bookings cannot be linked to customers. |
+| public.inventory_items | Clothes reference, to know what was rented. | id | Referenced by transactions.item_id | Category and sale info are needed for category sales and correct revenue. |
+| public.transactions | Rental bookings, the main fact source. | id | customer_id references profiles.id; item_id references inventory_items.id | All revenue counts and demand reports come from this table. Cancelled rows stay in raw for audit. |
+| public.payments | Money log to double-check bookings. | id | transaction_id references transactions.id | Money in payments must match money in bookings. |
 
-### inventory_items
+### 2.2 Column Specification
 
-- Name: public.inventory_items
-- Purpose: clothes reference, to know what was rented.
-- Important columns and types: id INTEGER, name TEXT, category TEXT, price NUMERIC, status TEXT, on_sale BOOLEAN, discount_pct NUMERIC NULL, sale_price NUMERIC NULL, sale_ends_at TIMESTAMPTZ NULL, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ.
-- Primary key: id.
-- Relationships: referenced by transactions.item_id.
-- Reason for inclusion: category and sale info are needed for category sales and correct revenue.
-
-### transactions
-
-- Name: public.transactions
-- Purpose: rental bookings, the main fact source.
-- Important columns and types: id TEXT, customer_id TEXT NULL, item_id INTEGER NULL, rental_date DATE NULL, due_date DATE NULL, return_date DATE NULL, status TEXT, rental_fee NUMERIC, downpayment NUMERIC, total_paid NUMERIC, balance NUMERIC, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ.
-- Primary key: id.
-- Relationships: customer_id references profiles.id, item_id references inventory_items.id.
-- Reason for inclusion: all revenue counts and demand reports come from this table. Cancelled rows stay in raw, removed from sales later.
-
-### payments
-
-- Name: public.payments
-- Purpose: money log to double-check bookings.
-- Important columns and types: id TEXT, transaction_id TEXT, amount NUMERIC, method TEXT, status TEXT, created_at TIMESTAMPTZ.
-- Primary key: id.
-- Relationships: transaction_id references transactions.id.
-- Reason for inclusion: money in payments must match money in bookings.
+| Table | Column | Type | Nullable |
+| ----- | ------ | ---- | -------- |
+| profiles | id | TEXT | No |
+| profiles | name | TEXT | No |
+| profiles | phone | TEXT | Yes |
+| profiles | address | TEXT | Yes |
+| profiles | preferences | TEXT | Yes |
+| profiles | created_at | TIMESTAMPTZ | No |
+| profiles | updated_at | TIMESTAMPTZ | No |
+| inventory_items | id | INTEGER | No |
+| inventory_items | name | TEXT | No |
+| inventory_items | category | TEXT | No |
+| inventory_items | price | NUMERIC | No |
+| inventory_items | status | TEXT | No |
+| inventory_items | on_sale | BOOLEAN | No |
+| inventory_items | discount_pct | NUMERIC | Yes |
+| inventory_items | sale_price | NUMERIC | Yes |
+| inventory_items | sale_ends_at | TIMESTAMPTZ | Yes |
+| inventory_items | created_at | TIMESTAMPTZ | No |
+| inventory_items | updated_at | TIMESTAMPTZ | No |
+| transactions | id | TEXT | No |
+| transactions | customer_id | TEXT | Yes |
+| transactions | item_id | INTEGER | Yes |
+| transactions | rental_date | DATE | Yes |
+| transactions | due_date | DATE | Yes |
+| transactions | return_date | DATE | Yes |
+| transactions | status | TEXT | No |
+| transactions | rental_fee | NUMERIC | No |
+| transactions | downpayment | NUMERIC | No |
+| transactions | total_paid | NUMERIC | No |
+| transactions | balance | NUMERIC | No |
+| transactions | created_at | TIMESTAMPTZ | No |
+| transactions | updated_at | TIMESTAMPTZ | No |
+| payments | id | TEXT | No |
+| payments | transaction_id | TEXT | No |
+| payments | amount | NUMERIC | No |
+| payments | method | TEXT | No |
+| payments | status | TEXT | No |
+| payments | created_at | TIMESTAMPTZ | No |
 
 ---
 
 ## 3. Extraction Validation and Data Quality Checks
 
-Scope limitation: focus on extraction-level validation. Data cleaning, standardization, and business transformations will be documented in the Transformation Stage.
+Scope limitation: focus on extraction-level validation only. Data cleaning, standardization, and business transformations belong to the separate Transformation document.
 
 | Check Name | Target | Purpose | Validation Criteria |
 | ---------- | ------ | ------- | ------------------- |
@@ -139,34 +192,30 @@ How metadata and logs will be used:
 
 ## 5. Log Retention and Access
 
-- Log retention period and justification: at least 12 months for logs, raw folders, checkpoints, and quarantine files. Covers one school year, seasonal peaks, and defense re-checks.
-- Storage location: project data/logs/, data/raw/, data/state/, data/quarantine/. Zip backup before submission or defense.
-- Access permissions: team members and panel can read. Only the runner can write. Passwords never in logs. .env never shared.
-- Archiving requirements: logs older than 90 days zipped monthly. Old raw data may move to archive but must stay openable.
-- Deletion rules and responsible process: logs must not be deleted before the retention period or while needed for troubleshooting, auditing, or recovery. Deletion needs lead approval and proof that final reports still exist. An authorized operator performs and records deletion.
-- Operational logs vs audit records: daily run logs are operational. Dated raw folders and checkpoints are audit records and follow the same 12-month minimum; longer school retention applies to audit records separately if required.
+| # | Item | Rule |
+| - | ---- | ---- |
+| 1 | Retention period | At least 12 months for logs, raw folders, checkpoints, and quarantine files. This covers one school year, seasonal peaks, and defense re-checks. |
+| 2 | Storage location | Project data/logs/, data/raw/, data/state/, and data/quarantine/. Zip a backup before submission or defense. |
+| 3 | Access permissions | Team members and the panel can read. Only the runner can write. Passwords never appear in logs, and .env is never shared. |
+| 4 | Archiving | Logs older than 90 days are zipped monthly. Old raw data may move to archive but must stay openable. |
+| 5 | Deletion rules | Logs are not deleted before the retention period or while still needed for troubleshooting, auditing, or recovery. Deletion needs lead approval and proof that final reports still exist, and an authorized operator performs and records it. |
+| 6 | Operational vs audit records | Daily run logs are operational. Dated raw folders and checkpoints are audit records and follow the same 12-month minimum; longer school retention applies separately if required. |
 
 ---
 
 ## 6. Extraction Data Contract and Naming Convention
 
-### 1. Required Schema
+### 6.1 Required Schema
 
-Expected output per run: four Parquet files in data/raw/dt=YYYY-MM-DD/:
+Each run outputs four Parquet files in data/raw/dt=YYYY-MM-DD/: profiles.parquet, inventory_items.parquet, transactions.parquet, and payments.parquet. Columns follow Section 2 with correct types. Every file must have an id, plus the customerId, itemId, and transactionId links where they apply. Main IDs are never blank or repeated in the same file, and link fields are never blank except where NULL is explicitly allowed and preserved for later handling.
 
-- profiles.parquet, inventory_items.parquet, transactions.parquet, payments.parquet
+### 6.2 Naming Convention
 
-Columns as listed in Section 2, with correct types. Required identifiers: id in every file, plus customerId, itemId, transactionId links where applicable. Constraints: main IDs not blank and not repeated in the same file; link fields not blank except where NULL is explicitly allowed and preserved for later handling.
+The live source uses snake_case, while the planned pipeline uses camelCase canonical names to match the shop app code, as shown in the mapping below. Short forms stay consistent: Pct means percent (discountPct) and At means datetime (saleEndsAt, createdAt). New fields copy the app spelling. Primary keys are named id, and foreign keys use customerId, itemId, and transactionId in canonical form.
 
-### 2. Naming Convention
+### 6.3 Schema Consistency
 
-- Column naming format: live source uses snake_case. Planned pipeline canonical names use camelCase to match shop app code, with a justified mapping defined below.
-- Abbreviations and consistency: Pct means percent (discountPct), At means datetime (saleEndsAt, createdAt). New fields must copy the app spelling.
-- Primary and foreign keys: primary keys named id. Foreign keys named customerId, itemId, transactionId in canonical form.
-
-### 3. Schema Consistency
-
-Unexpected changes to column names, data types, or required fields will stop the run. Partial files will be removed. The log will name the problem column. The column list and this contract will be updated together before re-running the missed date. New source columns will be ignored until agreed. New status values will be saved as-is in raw; the next stage will decide handling with a log note.
+Unexpected changes to column names, data types, or required fields stop the run, and partial files are removed. The log names the problem column. The column list and this contract are updated together before re-running the missed date. New source columns are ignored until agreed, and new status values are saved as-is in raw, leaving the next stage to decide handling with a log note.
 
 Example mapping format required by the activity:
 
@@ -200,13 +249,13 @@ If the standardized field name is customer_id, it must be used consistently in t
 
 | Validation condition | Acceptance criteria | Pipeline action | Automatic or manual decision, responsible |
 | -------------------- | ------------------- | --------------- | ----------------------------------------- |
-| All critical checks pass | Required tables and columns exist; identifiers present and unique; counts match; files complete; watermark safe. | Mark APPROVED and continue to Transformation. | Automatic. |
+| All critical checks pass | Required tables and columns exist; identifiers present and unique; counts match; files complete; watermark safe. | Mark APPROVED and release for handover. | Automatic. |
 | Non-critical warnings remain | Duplicates logged, zero new rows on quiet day, or count change, but extraction is complete. | Hold for review; preserve data unchanged. | MANUAL REVIEW by lead or data owner. |
 | A critical check fails | Source unavailable, identifiers invalid, counts mismatch, or extraction incomplete. | Mark REJECTED; delete partial date folder, keep old checkpoint, stop handover. Retry transient failures on next run. | Automatic stop; developer resolves the failure. |
 
 ### Handover
 
-Planned handover to Transformation: 4 staged datasets with row counts, run ID and date, mode (demo or live), extraction window, validation results, errors, checkpoint value, log location, and acceptance status. Next stage will acknowledge run ID and status.
+Planned handover to the next stage (Transformation, separate document): 4 staged datasets with row counts, run ID and date, mode (demo or live), extraction window, validation results, errors, checkpoint value, log location, and acceptance status. Next stage will acknowledge run ID and status.
 
 Required decisions:
 
@@ -219,7 +268,7 @@ Decision rules:
 
 | Overall Condition | Acceptance Decision | Pipeline Action |
 | ----------------- | ------------------- | --------------- |
-| All required tables PASS | APPROVED | Proceed to Transformation |
+| All required tables PASS | APPROVED | Release for handover |
 | One or more non-critical WARNING | MANUAL REVIEW | Hold pipeline |
 | One or more critical FAIL | REJECTED | Stop / retry / quarantine |
 
