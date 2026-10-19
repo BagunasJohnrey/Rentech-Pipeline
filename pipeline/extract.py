@@ -16,6 +16,8 @@ from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+import polars as pl
+
 from pipeline import config as C
 
 log = logging.getLogger(__name__)
@@ -98,3 +100,40 @@ def _select_sql(table: str, has_watermark: bool) -> str:
         sql += f' WHERE {C.TABLES[table]["watermark_sql"]}'
         sql += f' ORDER BY {C.TABLES[table]["watermark_order"]}'
     return sql
+
+
+def extract_table(
+    engine, table: str, last_run: datetime | None
+) -> pl.DataFrame:
+    """Extract one table incrementally into a Polars frame (canonical names)."""
+    has_watermark = last_run is not None
+    sql = _select_sql(table, has_watermark)
+    log.info(
+        "Extracting %s (%s)",
+        table,
+        f"incremental since {last_run.isoformat()}" if has_watermark
+        else "initial load (no watermark)",
+    )
+    # DB timestamps are naive; bind a naive UTC watermark to match.
+    bound = last_run.replace(tzinfo=None) if has_watermark else None
+    with engine.connect() as conn:
+        params = {"last_run": bound} if bound is not None else {}
+        result = conn.execute(text(sql), params)
+        rows = result.mappings().all()
+    if not rows:
+        log.info("Extracted %s: 0 rows", table)
+        return pl.DataFrame(
+            schema={c: pl.String for c in C.TABLES[table]["columns"]}
+        )
+    df = pl.from_dicts([dict(r) for r in rows])
+    log.info("Extracted %s: %d rows", table, df.height)
+    return df
+
+
+def extract_all(
+    engine, data_dir: Path = C.DEFAULT_DATA_DIR
+) -> dict[str, pl.DataFrame]:
+    """Extract every source table using the stored watermark."""
+    last_run = read_last_run(data_dir)
+    log.info("Watermark last_run=%s", last_run.isoformat() if last_run else "none")
+    return {t: extract_table(engine, t, last_run) for t in C.TABLES}
