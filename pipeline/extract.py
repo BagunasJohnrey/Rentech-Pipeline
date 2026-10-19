@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
@@ -137,3 +137,23 @@ def extract_all(
     last_run = read_last_run(data_dir)
     log.info("Watermark last_run=%s", last_run.isoformat() if last_run else "none")
     return {t: extract_table(engine, t, last_run) for t in C.TABLES}
+
+
+def stage_raw(
+    frames: dict[str, pl.DataFrame],
+    run_date: date,
+    data_dir: Path = C.DEFAULT_DATA_DIR,
+) -> Path:
+    """Write bronze snapshots: data/raw/dt=YYYY-MM-DD/<table>.parquet (zstd)."""
+    partition = Path(data_dir) / "raw" / f"dt={run_date.isoformat()}"
+    partition.mkdir(parents=True, exist_ok=True)
+    counts: dict[str, int] = {}
+    for table, df in frames.items():
+        out = partition / f"{table}.parquet"
+        df.write_parquet(str(out), compression="zstd")
+        counts[table] = df.height
+        log.info("Staged raw %s: %d rows -> %s", table, df.height, out)
+    (partition / "_counts.json").write_text(
+        json.dumps(counts, indent=2), encoding="utf-8"
+    )
+    return partition
