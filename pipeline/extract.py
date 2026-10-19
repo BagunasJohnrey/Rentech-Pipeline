@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import date, datetime
+import random
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
@@ -157,3 +158,132 @@ def stage_raw(
         json.dumps(counts, indent=2), encoding="utf-8"
     )
     return partition
+
+
+def generate_sample_data(
+    n_customers: int = 30,
+    n_items: int = 25,
+    n_transactions: int = 120,
+    seed: int = 42,
+    run_at: datetime | None = None,
+    include_bad_rows: bool = True,
+) -> dict[str, pl.DataFrame]:
+    """Deterministic single-store sample mimicking the Prisma schema (no DB)."""
+    rng = random.Random(seed)
+    run_at = run_at or datetime.now(timezone.utc)
+    base = (run_at - timedelta(days=90)).date()
+
+    profiles = [
+        {
+            "id": f"cust-{i:03d}",
+            "name": f"Customer {i}",
+            "phone": f"+63917{i:07d}",
+            "address": "Balayan, Batangas",
+            "preferences": rng.choice(C.CATEGORIES + [""]),
+            "createdAt": datetime.combine(
+                base + timedelta(days=i % 90), datetime.min.time(), tzinfo=timezone.utc
+            ),
+            "updatedAt": datetime.combine(
+                base + timedelta(days=i % 90), datetime.min.time(), tzinfo=timezone.utc
+            ) + timedelta(hours=1),
+        }
+        for i in range(1, n_customers + 1)
+    ]
+
+    items = []
+    for i in range(1, n_items + 1):
+        price = float(rng.choice([1500, 2000, 2500, 3000, 3500, 5000]))
+        on_sale = rng.random() < 0.3
+        discount = float(rng.choice([0, 10, 15, 20])) if on_sale else 0.0
+        sale_price = round(price * 0.85, 2) if on_sale and rng.random() < 0.4 else None
+        sale_ends = None
+        if on_sale:
+            sale_ends = datetime.combine(
+                base + timedelta(days=rng.randint(0, 120)), datetime.min.time()
+            )
+        items.append({
+            "id": f"item-{i:03d}",
+            "name": f"{rng.choice(C.CATEGORIES)} #{i}",
+            "category": C.CATEGORIES[(i - 1) % len(C.CATEGORIES)],
+            "price": price,
+            "status": "Available",
+            "onSale": on_sale,
+            "discountPct": discount,
+            "salePrice": sale_price,
+            "saleEndsAt": sale_ends,
+            "createdAt": datetime.combine(
+                base + timedelta(days=i % 90), datetime.min.time(), tzinfo=timezone.utc
+            ),
+            "updatedAt": datetime.combine(
+                base + timedelta(days=i % 90), datetime.min.time(), tzinfo=timezone.utc
+            ) + timedelta(hours=1),
+        })
+
+    transactions, payments = [], []
+    pay_id = 1
+    for n in range(1, n_transactions + 1):
+        cust = rng.choice(profiles)["id"]
+        item = rng.choice(items)
+        rental = base + timedelta(days=rng.randint(0, 89))
+        due = rental + timedelta(days=rng.randint(1, 7))
+        status = rng.choice(C.STATUSES)
+        returned = (
+            rental + timedelta(days=rng.randint(1, 9)) if status == "Returned" else None
+        )
+        fee = round(item["price"] * rng.choice([1.0, 1.0, 1.0, 0.9]), 2)
+        down = round(fee * 0.5, 2)
+        paid = fee if status == "Returned" else (down if status != "Reserved" else 0.0)
+        created = datetime.combine(rental, datetime.min.time(), tzinfo=timezone.utc)
+        txn_id = f"txn-{n:04d}"
+        transactions.append({
+            "id": txn_id,
+            "customerId": cust,
+            "itemId": item["id"],
+            "rentalDate": rental,
+            "dueDate": due,
+            "returnDate": returned,
+            "status": status,
+            "rentalFee": fee,
+            "downpayment": down,
+            "totalPaid": paid,
+            "balance": round(fee - paid, 2),
+            "createdAt": created,
+            "updatedAt": created + timedelta(hours=1),
+        })
+        n_pays = 2 if status == "Returned" and rng.random() < 0.5 else 1
+        if paid <= 0:
+            amounts: list[float] = []
+        elif n_pays == 2 and paid > down:
+            amounts = [down, round(paid - down, 2)]
+        else:
+            amounts = [paid]
+        for amt in amounts:
+            if amt <= 0:
+                continue
+            payments.append({
+                "id": f"pay-{pay_id:04d}",
+                "transactionId": txn_id,
+                "amount": amt,
+                "method": rng.choice(["cash", "gcash", "cash"]),
+                "status": "confirmed",
+                "createdAt": created + timedelta(hours=1),
+            })
+            pay_id += 1
+
+    if include_bad_rows:
+        # Kept in bronze for audit; flagged in a later stage, never cleaned here.
+        bad_fee = dict(transactions[0])
+        bad_fee["id"] = "txn-BAD1"
+        bad_fee["rentalFee"] = -500.0
+        transactions.append(bad_fee)
+        bad_due = dict(transactions[1])
+        bad_due["id"] = "txn-BAD2"
+        bad_due["dueDate"] = bad_due["rentalDate"] - timedelta(days=3)
+        transactions.append(bad_due)
+
+    return {
+        "profiles": pl.from_dicts(profiles),
+        "inventory_items": pl.from_dicts(items),
+        "transactions": pl.from_dicts(transactions),
+        "payments": pl.from_dicts(payments),
+    }
