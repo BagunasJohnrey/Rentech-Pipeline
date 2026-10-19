@@ -1,0 +1,12 @@
+# RenTech extraction-only pipeline - pinned stack (no Pandas, no streaming).
+# psycopg3 driver (binary wheel avoids needing libpq build tools)
+psycopg[binary]==3.3.5
+# SQLAlchemy 2.x - pooled engine + read-only SELECTs
+SQLAlchemy==2.0.53
+# Polars - in-memory frame between SQL and Parquet
+polars==1.44.2
+# PyArrow - Parquet staging engine (used via Polars)
+pyarrow==25.0.1
+# Scheduler (nightly 00:00) + env loading
+APScheduler==3.11.3
+python-dotenv==1.2.2

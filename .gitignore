@@ -1,0 +1,12 @@
+.env
+*.pyc
+__pycache__/
+.venv/
+.idea/
+.vscode/
+data/raw/**/*.parquet
+data/logs/*.log
+data/logs/archive/
+data/state/last_run.json
+data/quarantine/**/*.parquet
+!data/**/.gitkeep
