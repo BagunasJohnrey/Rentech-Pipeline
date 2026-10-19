@@ -7,8 +7,11 @@ lives here.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -60,3 +63,38 @@ def ping(engine: Engine) -> bool:
         conn.execute(text("SELECT 1"))
     log.info("Source connection OK")
     return True
+
+
+def read_last_run(data_dir: Path = C.DEFAULT_DATA_DIR) -> datetime | None:
+    """Return the watermark, or None (=> full extract) if missing/corrupt."""
+    state_path = Path(data_dir) / C.STATE_FILE
+    if not state_path.exists():
+        return None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        raw = payload.get("last_run")
+        return datetime.fromisoformat(raw) if raw else None
+    except (ValueError, OSError) as exc:
+        log.warning("Could not read watermark %s: %s (full extract)", state_path, exc)
+        return None
+
+
+def write_last_run(run_at: datetime, data_dir: Path = C.DEFAULT_DATA_DIR) -> Path:
+    """Persist the watermark. Caller must invoke ONLY after a successful run."""
+    state_path = Path(data_dir) / C.STATE_FILE
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"last_run": run_at.isoformat()}, indent=2), encoding="utf-8"
+    )
+    return state_path
+
+
+def _select_sql(table: str, has_watermark: bool) -> str:
+    """Explicit-column SELECT with physical AS canonical aliases + window."""
+    mapping: dict[str, str] = C.TABLES[table]["columns"]
+    cols = ", ".join(f'"{phys}" AS "{canon}"' for canon, phys in mapping.items())
+    sql = f'SELECT {cols} FROM "{table}"'
+    if has_watermark:
+        sql += f' WHERE {C.TABLES[table]["watermark_sql"]}'
+        sql += f' ORDER BY {C.TABLES[table]["watermark_order"]}'
+    return sql
