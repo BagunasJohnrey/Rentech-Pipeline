@@ -58,6 +58,19 @@ python -m pipeline.run_extract --schedule
 Batch only; no Pandas, no Spark/Airflow/Kafka; single machine; read-only on
 shop tables (never writes back); no transformation in this stage.
 
+## Sample log output (`--demo`, seed=42)
+
+```text
+2026-09-16 17:27:21,703 | INFO    | rentech.extract | === RenTech nightly extract dt=2026-09-16 (mode=demo) ===
+2026-09-16 17:27:21,705 | INFO    | rentech.extract | Staged raw profiles: 30 rows -> data\raw\dt=2026-09-16\profiles.parquet
+2026-09-16 17:27:21,709 | INFO    | rentech.extract | Staged raw inventory_items: 25 rows -> data\raw\dt=2026-09-16\inventory_items.parquet
+2026-09-16 17:27:21,712 | INFO    | rentech.extract | Staged raw transactions: 122 rows -> data\raw\dt=2026-09-16\transactions.parquet
+2026-09-16 17:27:21,713 | INFO    | rentech.extract | Staged raw payments: 132 rows -> data\raw\dt=2026-09-16\payments.parquet
+2026-09-16 17:27:21,713 | INFO    | rentech.extract | Raw bronze staged: data\raw\dt=2026-09-16 (309 rows total)
+2026-09-16 17:27:21,714 | INFO    | pipeline.validate_extract | All extraction checks PASS (4 tables, 309 rows)
+2026-09-16 17:27:21,714 | INFO    | rentech.extract | === Extract SUCCESS dt=2026-09-16 raw=data\raw\dt=2026-09-16 rows=309 status=APPROVED log=data\logs\pipeline_2026-09-16.log ===
+```
+
 ## Members
 
 1. Noilee Anne Pagkaliwagan - Documentation

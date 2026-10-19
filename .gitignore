@@ -5,6 +5,7 @@ __pycache__/
 .idea/
 .vscode/
 data/raw/**/*.parquet
+data/raw/**/_counts.json
 data/logs/*.log
 data/logs/archive/
 data/state/last_run.json
