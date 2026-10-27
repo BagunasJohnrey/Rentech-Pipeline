@@ -683,16 +683,15 @@ def run_transform(data_dir: Path, run_date: date) -> dict:
     dim_customer = build_dim_customer(profiles)
     dim_item = build_dim_item(items)
 
-    min_event = min(
-        utc_to_manila_date(r.get("createdAt")) or run_date
-        for df in frames.values() for r in df.iter_rows(named=True)
-        if r.get("createdAt")
-    )
-    max_event = max(
-        utc_to_manila_date(r.get("createdAt")) or run_date
-        for df in frames.values() for r in df.iter_rows(named=True)
-        if r.get("createdAt")
-    )
+    dates = []
+    for df in frames.values():
+        for r in df.iter_rows(named=True):
+            for col in ("createdAt", "rentalDate", "dueDate", "returnDate", "saleEndsAt"):
+                d = utc_to_manila_date(r.get(col))
+                if d:
+                    dates.append(d)
+    min_event = min(dates) if dates else run_date
+    max_event = max(dates) if dates else run_date
     max_date = max(max_event, run_date)
     dim_date = build_dim_date(min_event, max_date)
 
