@@ -7,4 +7,4 @@ and forecasting belong to later stages and must not be added here.
 """
 
 __version__ = "0.1.0"
-__all__ = ["config", "extract", "validate_extract", "run_extract"]
+__all__ = ["config", "extract", "validate_extract", "run_extract", "transform", "validate_transform", "run_transform"]

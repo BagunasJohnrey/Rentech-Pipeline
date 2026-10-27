@@ -22,6 +22,15 @@ from pathlib import Path
 DEFAULT_DATA_DIR = Path(os.getenv("RENTECH_DATA_DIR", "data"))
 STATE_FILE = "state/last_run.json"
 
+# Stage 2 is file-only: no target database and no Stage 2 credentials.
+CORE_TABLES = [
+    "dim_customer",
+    "dim_item",
+    "dim_date",
+    "fact_sales",
+    "agg_daily_category_sales",
+]
+
 # Match the boutique catalog + Postgres enums (case-sensitive).
 CATEGORIES = ["Gown", "Barong", "Suit", "Costume", "Filipiniana"]
 # Weighted like the live TEST seed; Cancelled excluded downstream.
@@ -104,7 +113,6 @@ REQUIRED_IDS: dict[str, list[str]] = {
     "transactions": ["id", "customerId", "itemId"],
     "payments": ["id", "transactionId"],
 }
-
 
 if __name__ == "__main__":  # quick contract self-check
     assert set(TABLES) == {"transactions", "payments", "inventory_items", "profiles"}
