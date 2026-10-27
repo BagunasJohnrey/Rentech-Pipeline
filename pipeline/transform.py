@@ -62,6 +62,19 @@ def utc_to_manila_date(ts: Any) -> date | None:
         return ts
     return None
 
+def _to_utc(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
+    exprs = []
+    for column in columns:
+        if column not in df.columns:
+            continue
+        dtype = df.schema[column]
+        if isinstance(dtype, pl.Datetime):
+            if dtype.time_zone is not None:
+                exprs.append(pl.col(column).dt.convert_time_zone("UTC"))
+            else:
+                exprs.append(pl.col(column).dt.replace_time_zone("UTC"))
+    return df.with_columns(exprs) if exprs else df
+
 def normalize_name(name: Any) -> tuple[str | None, bool]:
     if name is None:
         return None, False
@@ -174,3 +187,103 @@ def standardize_item_status(status: Any) -> str:
     if s in ("Deleted", "Removed", "Archived"):
         return "DELETED"
     return "UNKNOWN"
+
+def build_dim_date(min_date: date, max_date: date) -> pl.DataFrame:
+    rows = []
+    current = min_date
+    while current <= max_date:
+        _, iso_week, iso_day = current.isocalendar()
+        rows.append({
+            "date_key": int(current.strftime("%Y%m%d")),
+            "date": current,
+            "year": current.year,
+            "quarter": (current.month - 1) // 3 + 1,
+            "month": current.month,
+            "month_name": current.strftime("%B"),
+            "day": current.day,
+            "day_of_week": iso_day,
+            "day_name": current.strftime("%A"),
+            "week_of_year": iso_week,
+            "is_weekend": iso_day >= 6,
+            "is_holiday": False,
+        })
+        current += timedelta(days=1)
+    return pl.DataFrame(rows)
+
+def build_dim_customer(profiles: pl.DataFrame) -> pl.DataFrame:
+    rows = []
+    name_phone_counts: dict[tuple[str, str], int] = {}
+    for row in profiles.iter_rows(named=True):
+        name_clean, name_valid = normalize_name(row.get("name"))
+        phone_clean, phone_valid = normalize_phone(row.get("phone"))
+        addr_clean, addr_valid = normalize_address(row.get("address"))
+        prefs_list, pref_count = parse_preferences(row.get("preferences"))
+        key = (name_clean or "", phone_clean or "")
+        name_phone_counts[key] = name_phone_counts.get(key, 0) + 1
+        rows.append({
+            "customer_key": xxhash64_positive(row["id"]),
+            "customer_id": row["id"],
+            "name": name_clean,
+            "name_valid": name_valid,
+            "phone": phone_clean,
+            "phone_valid": phone_valid,
+            "has_phone": phone_clean is not None,
+            "address": addr_clean,
+            "address_valid": addr_valid,
+            "preferences": prefs_list,
+            "preference_count": pref_count,
+            "potential_duplicate_customer": False,
+            "created_at": row.get("createdAt"),
+            "updated_at": row.get("updatedAt"),
+            "is_current": True,
+        })
+    for r in rows:
+        r["potential_duplicate_customer"] = name_phone_counts[
+            (r["name"] or "", r["phone"] or "")
+        ] > 1
+    df = pl.DataFrame(rows)
+    df = df.with_columns(pl.col("preferences").cast(pl.List(pl.String)))
+    return _to_utc(df, ["created_at", "updated_at"])
+
+def build_dim_item(items: pl.DataFrame) -> pl.DataFrame:
+    rows = []
+    for row in items.iter_rows(named=True):
+        name_clean = " ".join((row.get("name") or "").strip().split()).title()
+        category, source_category = standardize_category(row.get("category"))
+        price = float(row.get("price") or 0)
+        on_sale = bool(row.get("onSale"))
+        discount_pct = float(row.get("discountPct") or 0)
+        inconsistent = (not on_sale) and discount_pct > 0
+        effective_price = (
+            round(price * (1 - discount_pct / 100), 2)
+            if on_sale and not inconsistent else price
+        )
+        status = standardize_item_status(row.get("status"))
+        rows.append({
+            "item_key": xxhash64_positive(str(row["id"])),
+            "item_id": str(row["id"]),
+            "name": name_clean,
+            "category": category,
+            "source_category": source_category,
+            "price": price,
+            "effective_price": effective_price,
+            "on_sale": on_sale,
+            "discount_pct": 0.0 if inconsistent else discount_pct,
+            "sale_price": float(row["salePrice"]) if row.get("salePrice") is not None else None,
+            "sale_ends_at": utc_to_manila_date(row.get("saleEndsAt")),
+            "status": status,
+            "is_deleted": status == "DELETED",
+            "is_test_item": category == "Other" and (
+                (source_category or "").lower() == "test" or "test" in name_clean.lower()
+            ),
+            "sale_flag_inconsistent": inconsistent,
+            "created_at": row.get("createdAt"),
+            "updated_at": row.get("updatedAt"),
+            "is_current": True,
+        })
+    df = pl.DataFrame(rows)
+    df = df.with_columns([
+        pl.col("sale_ends_at").cast(pl.Date),
+        pl.col("sale_price").cast(pl.Float64),
+    ])
+    return _to_utc(df, ["created_at", "updated_at"])
