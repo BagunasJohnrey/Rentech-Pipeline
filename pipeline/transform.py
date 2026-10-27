@@ -468,6 +468,273 @@ def build_fact_sales(
     )
     return fact_df, excluded_df, excluded_payments_df
 
+def build_agg_daily_category_sales(fact: pl.DataFrame, dim_item: pl.DataFrame) -> pl.DataFrame:
+    if fact.height == 0:
+        return pl.DataFrame(schema={
+            "date_key": pl.Int64,
+            "category_key": pl.Int64,
+            "category": pl.String,
+            "rental_count": pl.Int64,
+            "returned_count": pl.Int64,
+            "total_rental_fee": pl.Float64,
+            "total_payment": pl.Float64,
+            "total_balance_due": pl.Float64,
+            "total_overpayment": pl.Float64,
+        })
+    cat_map = {r["item_key"]: (r["category"], xxhash64_positive(r["category"])) for r in dim_item.iter_rows(named=True)}
+    rows = []
+    for row in fact.iter_rows(named=True):
+        cat, cat_key = cat_map.get(row["item_key"], ("Other", xxhash64_positive("Other")))
+        rows.append({
+            "date_key": row["rental_date_key"],
+            "category_key": cat_key,
+            "category": cat,
+            "rental_count": 1,
+            "returned_count": 1 if row["is_returned"] else 0,
+            "total_rental_fee": row["rental_fee"],
+            "total_payment": row["payment_total"],
+            "total_balance_due": row["balance_due"],
+            "total_overpayment": row["overpayment_amount"],
+        })
+    if not rows:
+        return pl.DataFrame(schema={
+            "date_key": pl.Int64,
+            "category_key": pl.Int64,
+            "category": pl.String,
+            "rental_count": pl.Int64,
+            "returned_count": pl.Int64,
+            "total_rental_fee": pl.Float64,
+            "total_payment": pl.Float64,
+            "total_balance_due": pl.Float64,
+            "total_overpayment": pl.Float64,
+        })
+    df = pl.DataFrame(rows)
+    return df.group_by(["date_key", "category_key", "category"]).agg([
+        pl.col("rental_count").sum(),
+        pl.col("returned_count").sum(),
+        pl.col("total_rental_fee").sum(),
+        pl.col("total_payment").sum(),
+        pl.col("total_balance_due").sum(),
+        pl.col("total_overpayment").sum(),
+    ])
+
+def _swap_dir(staging: Path, target: Path) -> None:
+    if target.exists():
+        shutil.rmtree(target)
+    staging.replace(target)
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def _write_parquet(df: pl.DataFrame, path: Path) -> None:
+    df.write_parquet(str(path), compression="zstd")
+
+def build_rules_report(quarantine: dict, finished_at: datetime) -> dict:
+    rules = {}
+    for name, df in quarantine["quarantine"].items():
+        if df.height == 0:
+            continue
+        for row in df.iter_rows(named=True):
+            rule = row["rule_id"]
+            if rule not in rules:
+                rules[rule] = {"rule_id": rule, "count": 0, "examples": []}
+            rules[rule]["count"] += 1
+            if len(rules[rule]["examples"]) < 3:
+                rules[rule]["examples"].append({
+                    "source_table": row["source_table"],
+                    "source_id": row["source_id"],
+                    "reason_code": row["reason_code"],
+                    "reason_detail": row["reason_detail"],
+                })
+    for name, df in quarantine["audit"].items():
+        if df.height == 0:
+            continue
+        for row in df.iter_rows(named=True):
+            rule = row["rule_id"]
+            if rule not in rules:
+                rules[rule] = {"rule_id": rule, "count": 0, "examples": []}
+            rules[rule]["count"] += 1
+            if len(rules[rule]["examples"]) < 3:
+                rules[rule]["examples"].append({
+                    "source_table": "excluded_" + name,
+                    "source_id": row.get("transaction_id") or row.get("payment_id"),
+                    "reason_code": row["exclusion_reason"],
+                    "reason_detail": f"Excluded by {rule}",
+                })
+    return {"rules_version": RULES_VERSION, "applied_at": finished_at.isoformat(), "rules": list(rules.values())}
+
+def write_outputs(
+    data_dir: Path,
+    run_date: date,
+    run_id: str,
+    batch_id: str,
+    tables: dict[str, pl.DataFrame],
+    quarantine: dict,
+    started_at: datetime,
+) -> dict[str, Any]:
+    transformed_root = data_dir / "transformed"
+    staging = transformed_root / f".staging_dt={run_date.isoformat()}"
+    target = transformed_root / f"dt={run_date.isoformat()}"
+
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+
+    manifest_tables = {}
+    for name, df in tables.items():
+        _write_parquet(df, staging / f"{name}.parquet")
+        manifest_tables[name] = {"file": f"{name}.parquet", "rows": df.height}
+
+    audit_dir = staging / "audit"
+    audit_dir.mkdir()
+    audit_files = {}
+    for name, df in quarantine["audit"].items():
+        _write_parquet(df, audit_dir / f"{name}.parquet")
+        audit_files[name] = {"file": f"audit/{name}.parquet", "rows": df.height}
+
+    finished_at = datetime.now(UTC)
+    checksums = {
+        p.relative_to(staging).as_posix(): _sha256(p)
+        for p in staging.rglob("*.parquet")
+    }
+    fact = tables["fact_sales"]
+    amount_totals = {
+        "rental_fee": round(float(fact["rental_fee"].sum()), 2) if fact.height else 0.0,
+        "payment_total": round(float(fact["payment_total"].sum()), 2) if fact.height else 0.0,
+        "balance_due": round(float(fact["balance_due"].sum()), 2) if fact.height else 0.0,
+        "overpayment_amount": round(float(fact["overpayment_amount"].sum()), 2) if fact.height else 0.0,
+    }
+
+    manifest = {
+        "manifest_version": "1.0.0",
+        "transformation_run_id": run_id,
+        "batch_id": batch_id,
+        "batch_date": run_date.isoformat(),
+        "batch_window": "full_snapshot",
+        "source_extraction_run_id": None,
+        "source_partition": str(data_dir / "raw" / f"dt={run_date.isoformat()}"),
+        "output_partition": str(target),
+        "rules_version": RULES_VERSION,
+        "code_version": "transform-v1.0.0",
+        "business_timezone": "Asia/Manila",
+        "status": "REJECTED",
+        "started_at": started_at.isoformat(),
+        "completed_at": finished_at.isoformat(),
+        "row_counts": {
+            **{name: df.height for name, df in tables.items()},
+            **{f"audit/{name}": df.height for name, df in quarantine["audit"].items()},
+            **{name: df.height for name, df in quarantine["quarantine"].items()},
+        },
+        "checksums": checksums,
+        "validation_summary": None,
+        "rejection_rate": round(
+            sum(df.height for df in quarantine["quarantine"].values())
+            / (sum(quarantine["input_counts"].values()) or 1), 6
+        ),
+        "business_exclusion_rate": round(
+            quarantine["audit"]["excluded_sales"].height
+            / ((fact.height + quarantine["audit"]["excluded_sales"].height) or 1), 6
+        ),
+        "amount_totals": amount_totals,
+        "tables": manifest_tables,
+        "audit": audit_files,
+        "rules_applied": "_rules_applied.json",
+        "quarantine": {
+            name: {"file": f"{name}.parquet", "rows": df.height}
+            for name, df in quarantine["quarantine"].items()
+        },
+        "notes": "Parquet handover output; no credentials required for Stage 2.",
+    }
+    (staging / "_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    reconciliation = {
+        "run_id": run_id,
+        "batch_date": run_date.isoformat(),
+        "inputs": quarantine["input_counts"],
+        "outputs": {name: df.height for name, df in tables.items()},
+        "quarantine": {name: df.height for name, df in quarantine["quarantine"].items()},
+        "audit": {name: df.height for name, df in quarantine["audit"].items()},
+        "amount_totals": amount_totals,
+    }
+    (staging / "_reconciliation.json").write_text(
+        json.dumps(reconciliation, indent=2), encoding="utf-8"
+    )
+    (staging / "_rules_applied.json").write_text(
+        json.dumps(build_rules_report(quarantine, finished_at), indent=2),
+        encoding="utf-8",
+    )
+
+    _swap_dir(staging, target)
+    return {"partition": str(target), "manifest": manifest}
+
+def run_transform(data_dir: Path, run_date: date) -> dict:
+    started_at = datetime.now(UTC)
+    run_id = f"TRN_{run_date.isoformat().replace('-', '')}_{started_at.strftime('%H%M')}"
+    batch_id = f"BATCH_{run_date.isoformat().replace('-', '')}"
+
+    frames = read_bronze_partition(data_dir, run_date)
+    input_counts = {k: v.height for k, v in frames.items()}
+
+    profiles = frames["profiles"]
+    items = frames["inventory_items"]
+    transactions = frames["transactions"]
+    payments = frames["payments"]
+
+    dim_customer = build_dim_customer(profiles)
+    dim_item = build_dim_item(items)
+
+    min_event = min(
+        utc_to_manila_date(r.get("createdAt")) or run_date
+        for df in frames.values() for r in df.iter_rows(named=True)
+        if r.get("createdAt")
+    )
+    max_event = max(
+        utc_to_manila_date(r.get("createdAt")) or run_date
+        for df in frames.values() for r in df.iter_rows(named=True)
+        if r.get("createdAt")
+    )
+    max_date = max(max_event, run_date)
+    dim_date = build_dim_date(min_event, max_date)
+
+    transactions_clean, q_txns = clean_transactions(transactions)
+    valid_txn_ids = set(transactions_clean["id"].to_list()) if transactions_clean.height else set()
+    payments_clean, q_payments = clean_payments(payments, valid_txn_ids)
+
+    payments_agg = aggregate_payments(payments_clean)
+    fact_sales, excluded_sales, excluded_payments = build_fact_sales(
+        transactions_clean, payments_agg, payments_clean, dim_customer, dim_item, run_date
+    )
+    agg_daily_category_sales = build_agg_daily_category_sales(fact_sales, dim_item)
+
+    tables = {
+        "dim_customer": dim_customer,
+        "dim_item": dim_item,
+        "dim_date": dim_date,
+        "fact_sales": fact_sales,
+        "agg_daily_category_sales": agg_daily_category_sales,
+    }
+
+    quarantine = {
+        "input_counts": input_counts,
+        "quarantine": {
+            "quarantine_transactions": q_txns,
+            "quarantine_payments": q_payments,
+        },
+        "audit": {
+            "excluded_sales": excluded_sales,
+            "excluded_payments": excluded_payments,
+        },
+    }
+
+    result = write_outputs(data_dir, run_date, run_id, batch_id, tables, quarantine, started_at)
+
+    counts = {name: df.height for name, df in tables.items()}
+    counts.update({f"quarantine_{k}": v.height for k, v in quarantine["quarantine"].items()})
+    counts.update({f"audit_{k}": v.height for k, v in quarantine["audit"].items()})
+
+    logger.info("Transformation complete: %s", counts)
+    return {"counts": counts, "partition": result["partition"], "manifest": result["manifest"]}
+
 def build_dim_date(min_date: date, max_date: date) -> pl.DataFrame:
     rows = []
     current = min_date
