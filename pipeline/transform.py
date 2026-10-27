@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import hashlib
+import shutil
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -201,6 +202,33 @@ QUARANTINE_SCHEMA = {
     "batch_id": pl.String,
 }
 
+EXCLUDED_SALES_SCHEMA = {
+    "exclusion_id": pl.Int64,
+    "transaction_id": pl.String,
+    "customer_id": pl.String,
+    "item_id": pl.String,
+    "rental_date": pl.Date,
+    "rental_fee": pl.Float64,
+    "exclusion_reason": pl.String,
+    "rule_id": pl.String,
+    "excluded_at": pl.Datetime(time_unit="us", time_zone="UTC"),
+    "transformation_run_id": pl.String,
+}
+
+EXCLUDED_PAYMENTS_SCHEMA = {
+    "exclusion_id": pl.Int64,
+    "payment_id": pl.String,
+    "transaction_id": pl.String,
+    "amount": pl.Float64,
+    "method": pl.String,
+    "status": pl.String,
+    "created_at": pl.Datetime(time_unit="us", time_zone="UTC"),
+    "exclusion_reason": pl.String,
+    "rule_id": pl.String,
+    "excluded_at": pl.Datetime(time_unit="us", time_zone="UTC"),
+    "transformation_run_id": pl.String,
+}
+
 def clean_transactions(transactions: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     quarantine_rows = []
     clean_rows = []
@@ -293,6 +321,152 @@ def clean_payments(
         if quarantine_rows else pl.DataFrame(schema=QUARANTINE_SCHEMA)
     )
     return clean_df, quarantine_df
+
+def aggregate_payments(payments: pl.DataFrame) -> pl.DataFrame:
+    if payments.height == 0:
+        return pl.DataFrame(schema={
+            "transactionId": pl.String,
+            "payment_total": pl.Float64,
+            "payment_count": pl.Int64,
+            "latest_payment_date": pl.Datetime(time_unit="us", time_zone="UTC"),
+        })
+    completed = payments.filter(
+        pl.col("status").str.to_lowercase().is_in(["completed", "succeeded", "confirmed"])
+    )
+    return completed.group_by("transactionId").agg([
+        pl.col("amount").sum().alias("payment_total"),
+        pl.col("amount").count().alias("payment_count"),
+        pl.col("createdAt").max().alias("latest_payment_date"),
+    ])
+
+def build_fact_sales(
+    transactions: pl.DataFrame,
+    payments_agg: pl.DataFrame,
+    payments_clean: pl.DataFrame,
+    dim_customer: pl.DataFrame,
+    dim_item: pl.DataFrame,
+    batch_date: date,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    cust_map = {r["customer_id"]: r["customer_key"] for r in dim_customer.iter_rows(named=True)}
+    item_map = {str(r["item_id"]): r["item_key"] for r in dim_item.iter_rows(named=True)}
+    payments_map = {r["transactionId"]: r for r in payments_agg.iter_rows(named=True)}
+
+    payments_by_txn: dict[str, list[dict]] = {}
+    for payment in payments_clean.iter_rows(named=True):
+        if standardize_payment_status(payment.get("status")) == "COMPLETED":
+            payments_by_txn.setdefault(payment["transactionId"], []).append(payment)
+
+    fact_rows, excluded_rows, excluded_payment_rows = [], [], []
+
+    for row in transactions.iter_rows(named=True):
+        tid = row["id"]
+        status = standardize_transaction_status(row.get("status"))
+        rental_date = utc_to_manila_date(row.get("rentalDate"))
+        due_date = utc_to_manila_date(row.get("dueDate"))
+        return_date = utc_to_manila_date(row.get("returnDate"))
+        is_returned = return_date is not None
+
+        if status == "CANCELLED":
+            excluded_rows.append({
+                "exclusion_id": xxhash64_positive(f"transactions:{tid}:B-07"),
+                "transaction_id": tid,
+                "customer_id": row["customerId"],
+                "item_id": str(row["itemId"]),
+                "rental_date": rental_date,
+                "rental_fee": float(row.get("rentalFee") or 0),
+                "exclusion_reason": "CANCELLED",
+                "rule_id": "B-07",
+                "excluded_at": datetime.now(UTC),
+                "transformation_run_id": "",
+            })
+            for payment in payments_by_txn.get(tid, []):
+                excluded_payment_rows.append({
+                    "exclusion_id": xxhash64_positive(f"payments:{payment['id']}:B-07"),
+                    "payment_id": payment["id"],
+                    "transaction_id": tid,
+                    "amount": float(payment.get("amount") or 0),
+                    "method": standardize_payment_method(payment.get("method")),
+                    "status": "COMPLETED",
+                    "created_at": payment.get("createdAt"),
+                    "exclusion_reason": "CANCELLED",
+                    "rule_id": "B-07",
+                    "excluded_at": datetime.now(UTC),
+                    "transformation_run_id": "",
+                })
+            continue
+
+        rental_fee = float(row.get("rentalFee") or 0)
+        pay = payments_map.get(tid)
+        payment_total = float(pay["payment_total"]) if pay else 0.0
+        payment_count = int(pay["payment_count"]) if pay else 0
+        latest_payment_date = utc_to_manila_date(pay["latest_payment_date"]) if pay else None
+
+        balance_due = max(rental_fee - payment_total, 0.0)
+        overpayment_amount = max(payment_total - rental_fee, 0.0)
+        source_balance = float(row.get("balance") or 0)
+        ledger_mismatch = abs(source_balance - balance_due) > 0.01
+
+        rental_days = (due_date - rental_date).days if due_date and rental_date else 0
+        actual_rental_days = (return_date - rental_date).days if return_date and rental_date else None
+        overdue_days = (
+            max((return_date - due_date).days, 0) if is_returned and due_date
+            else max((batch_date - due_date).days, 0) if due_date else 0
+        )
+
+        fact_rows.append({
+            "sales_key": xxhash64_positive(tid),
+            "transaction_id": tid,
+            "customer_key": cust_map.get(row["customerId"]),
+            "customer_id": row["customerId"],
+            "item_key": item_map.get(str(row["itemId"])),
+            "item_id": str(row["itemId"]),
+            "rental_date_key": int(rental_date.strftime("%Y%m%d")) if rental_date else None,
+            "rental_date": rental_date,
+            "due_date_key": int(due_date.strftime("%Y%m%d")) if due_date else None,
+            "due_date": due_date,
+            "return_date_key": int(return_date.strftime("%Y%m%d")) if return_date else None,
+            "return_date": return_date,
+            "is_returned": is_returned,
+            "status": status,
+            "rental_days": rental_days,
+            "actual_rental_days": actual_rental_days,
+            "overdue_days": overdue_days,
+            "is_overdue": overdue_days > 0,
+            "is_future_booking": rental_date > batch_date if rental_date else False,
+            "rental_fee": rental_fee,
+            "payment_total": payment_total,
+            "payment_count": payment_count,
+            "balance_due": balance_due,
+            "overpayment_amount": overpayment_amount,
+            "source_balance": source_balance,
+            "ledger_mismatch": ledger_mismatch,
+            "latest_payment_date": latest_payment_date,
+            "created_at": row.get("createdAt"),
+            "updated_at": row.get("updatedAt"),
+        })
+
+    fact_df = pl.DataFrame(fact_rows) if fact_rows else transactions.head(0)
+    if fact_rows:
+        fact_df = fact_df.with_columns([
+            pl.col("return_date").cast(pl.Date),
+            pl.col("latest_payment_date").cast(pl.Date),
+            pl.col("actual_rental_days").cast(pl.Int64),
+        ])
+        fact_df = _to_utc(fact_df, ["created_at", "updated_at"])
+
+    excluded_df = (
+        pl.DataFrame(excluded_rows, schema=EXCLUDED_SALES_SCHEMA)
+        if excluded_rows else pl.DataFrame(schema=EXCLUDED_SALES_SCHEMA)
+    )
+    excluded_payments_df = (
+        pl.DataFrame(excluded_payment_rows, schema=EXCLUDED_PAYMENTS_SCHEMA)
+        if excluded_payment_rows else pl.DataFrame(schema=EXCLUDED_PAYMENTS_SCHEMA)
+    )
+    excluded_df = _to_utc(excluded_df, ["excluded_at"])
+    excluded_payments_df = _to_utc(
+        excluded_payments_df, ["created_at", "excluded_at"]
+    )
+    return fact_df, excluded_df, excluded_payments_df
 
 def build_dim_date(min_date: date, max_date: date) -> pl.DataFrame:
     rows = []
