@@ -188,6 +188,112 @@ def standardize_item_status(status: Any) -> str:
         return "DELETED"
     return "UNKNOWN"
 
+QUARANTINE_SCHEMA = {
+    "quarantine_id": pl.Int64,
+    "source_table": pl.String,
+    "source_id": pl.String,
+    "rule_id": pl.String,
+    "reason_code": pl.String,
+    "reason_detail": pl.String,
+    "raw_record": pl.String,
+    "detected_at": pl.Datetime(time_unit="us", time_zone="UTC"),
+    "transformation_run_id": pl.String,
+    "batch_id": pl.String,
+}
+
+def clean_transactions(transactions: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+    quarantine_rows = []
+    clean_rows = []
+
+    for row in transactions.iter_rows(named=True):
+        tid = row["id"]
+        rental_date = utc_to_manila_date(row.get("rentalDate"))
+        return_date = utc_to_manila_date(row.get("returnDate"))
+
+        if return_date and rental_date and return_date < rental_date:
+            quarantine_rows.append({
+                "quarantine_id": xxhash64_positive(f"transactions:{tid}:C-11"),
+                "source_table": "transactions",
+                "source_id": tid,
+                "rule_id": "C-11",
+                "reason_code": "INVALID_RETURN_DATE",
+                "reason_detail": f"returnDate {return_date} < rentalDate {rental_date}",
+                "raw_record": json.dumps({k: str(v) for k, v in row.items()}),
+                "detected_at": datetime.now(UTC),
+                "transformation_run_id": "",
+                "batch_id": "",
+            })
+            continue
+        clean_rows.append(row)
+
+    grouped: dict[tuple, list] = {}
+    for row in clean_rows:
+        key = (row["customerId"], row["itemId"], utc_to_manila_date(row.get("rentalDate")))
+        grouped.setdefault(key, []).append(row)
+
+    kept = []
+    for key, group in grouped.items():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+        group.sort(
+            key=lambda r: (
+                r.get("updatedAt") or "",
+                r.get("createdAt") or "",
+                r.get("id") or "",
+            ),
+            reverse=True,
+        )
+        kept.append(group[0])
+        for duplicate in group[1:]:
+            quarantine_rows.append({
+                "quarantine_id": xxhash64_positive(f"transactions:{duplicate['id']}:C-12"),
+                "source_table": "transactions",
+                "source_id": duplicate["id"],
+                "rule_id": "C-12",
+                "reason_code": "DUPLICATE_TRANSACTION",
+                "reason_detail": f"Duplicate natural key {key}, older updatedAt",
+                "raw_record": json.dumps({k: str(v) for k, v in duplicate.items()}),
+                "detected_at": datetime.now(UTC),
+                "transformation_run_id": "",
+                "batch_id": "",
+            })
+
+    clean_df = pl.DataFrame(kept) if kept else transactions.head(0)
+    quarantine_df = (
+        pl.DataFrame(quarantine_rows, schema=QUARANTINE_SCHEMA)
+        if quarantine_rows else pl.DataFrame(schema=QUARANTINE_SCHEMA)
+    )
+    return clean_df, quarantine_df
+
+def clean_payments(
+    payments: pl.DataFrame, valid_transaction_ids: set[str]
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    quarantine_rows = []
+    clean_rows = []
+    for row in payments.iter_rows(named=True):
+        if row["transactionId"] not in valid_transaction_ids:
+            quarantine_rows.append({
+                "quarantine_id": xxhash64_positive(f"payments:{row['id']}:C-16"),
+                "source_table": "payments",
+                "source_id": row["id"],
+                "rule_id": "C-16",
+                "reason_code": "INVALID_PARENT_TRANSACTION",
+                "reason_detail": f"Parent transaction {row['transactionId']} not found or quarantined",
+                "raw_record": json.dumps({k: str(v) for k, v in row.items()}),
+                "detected_at": datetime.now(UTC),
+                "transformation_run_id": "",
+                "batch_id": "",
+            })
+            continue
+        clean_rows.append(row)
+    clean_df = pl.DataFrame(clean_rows) if clean_rows else payments.head(0)
+    quarantine_df = (
+        pl.DataFrame(quarantine_rows, schema=QUARANTINE_SCHEMA)
+        if quarantine_rows else pl.DataFrame(schema=QUARANTINE_SCHEMA)
+    )
+    return clean_df, quarantine_df
+
 def build_dim_date(min_date: date, max_date: date) -> pl.DataFrame:
     rows = []
     current = min_date
